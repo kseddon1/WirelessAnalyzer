@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wlanscope"
+version = "0.1.0"
+description = "802.11 WLAN discovery, analysis and event sensor (curses UI or headless)"
+requires-python = ">=3.9"
+dependencies = []
+
+[project.scripts]
+wlanscope = "wlanscope.cli:main"
+
+[tool.setuptools]
+packages = ["wlanscope"]

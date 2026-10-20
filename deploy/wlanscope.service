@@ -1,0 +1,26 @@
+# Headless wlanscope sensor.
+#   sudo cp -r wlanscope /opt/wlanscope/        (the package directory)
+#   sudo cp wlanscope.example.toml /etc/wlanscope.toml   (then edit)
+#   sudo cp deploy/wlanscope.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now wlanscope
+# The monitor interface must exist first (your monitor-mode script / unit),
+# or add --setup-monitor to ExecStart to switch the interface itself.
+[Unit]
+Description=wlanscope 802.11 sensor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/wlanscope
+Environment=PYTHONUNBUFFERED=1
+# Webhook token kept out of the unit file:
+EnvironmentFile=-/etc/default/wlanscope
+ExecStart=/usr/bin/python3 -m wlanscope --headless -c /etc/wlanscope.toml --no-stdout-events
+Restart=always
+RestartSec=5
+RuntimeDirectory=wlanscope
+LogsDirectory=wlanscope
+
+[Install]
+WantedBy=multi-user.target

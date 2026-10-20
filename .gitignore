@@ -7,3 +7,6 @@ venv/
 
 
 
+*.pcap
+*.pcapng
+wlanscope-snapshot-*.json
