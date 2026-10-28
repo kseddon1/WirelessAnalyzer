@@ -156,6 +156,10 @@ with `--managed-ssid` / `[[managed_ssid]]` so their `OPEN_NETWORK` events are
 
 ## HTTP API (`--api host:port`, optional `--api-token`)
 
+The API is **off by default** — it only starts when you pass `--api host:port`.
+`--api-token` (or `WA_API_TOKEN`) requires a `Authorization: Bearer <token>`
+header on every request.
+
 | Request | Returns |
 |---|---|
 | `GET /health` | sensor id, uptime, radios, frame/event counters |
@@ -165,8 +169,99 @@ with `--managed-ssid` / `[[managed_ssid]]` so their `OPEN_NETWORK` events are
 | `POST /lock {"bssid": "..."}` or `{"band": "5g", "channel": 36}` | focus the radio(s) |
 | `POST /unlock` | resume hopping |
 
+### Pulling events from an agent (Hermes, cron, etc.)
+
+Instead of pushing webhooks, an external agent can poll `/events` and remember the last `seq` it saw:
+
+```bash
+API=http://127.0.0.1:8088
+TOKEN="$WA_API_TOKEN"
+
+# sensor liveness
+curl -s -H "Authorization: Bearer $TOKEN" "$API/health"
+
+# new warning+ events since the last sequence we processed
+curl -s -H "Authorization: Bearer $TOKEN" \
+  "$API/events?since=0&min_severity=warning&limit=50"
+
+# detail on a suspicious BSS
+curl -s -H "Authorization: Bearer $TOKEN" \
+  "$API/bss/00:c0:ca:66:66:66"
+```
+
+A polling script keeps `since` in a small state file so it never processes the same event twice:
+
+```python
+#!/usr/bin/env python3
+import json, os, urllib.request
+
+API   = os.environ["WL_API"]          # e.g. http://127.0.0.1:8088
+TOKEN = os.environ["WL_API_TOKEN"]
+SEQF  = os.path.expanduser("~/.wlanscope-since.txt")
+
+def read_seq():
+    try:
+        return int(open(SEQF).read().strip())
+    except Exception:
+        return 0
+
+def write_seq(seq):
+    with open(SEQF, "w") as f:
+        f.write(str(seq))
+
+since = read_seq()
+url = f"{API}/events?since={since}&min_severity=warning&limit=100"
+req = urllib.request.Request(url, headers={"Authorization": f"Bearer {TOKEN}"})
+with urllib.request.urlopen(req, timeout=15) as r:
+    events = json.loads(r.read())
+
+max_seq = since
+for ev in events:
+    max_seq = max(max_seq, ev.get("seq", 0))
+    print(f"[{ev.get('severity')}] {ev.get('alert')} "
+          f"{ev.get('ssid','')} {ev.get('bssid','')} {ev.get('client','')} "
+          f"{ev.get('message','')}")
+
+if events:
+    write_seq(max_seq)
+```
+
+Hermes can run this via its `terminal` tool (or a Hermes cron job), then fetch `/bss/<bssid>` or `/client/<mac>` for the full picture on anything that looks wrong, and decide whether to orchestrate a response.
+
+### Testing without a radio
+
+Generate a synthetic campus scenario and replay it with the API on, so you can validate the pull flow before deploying to a sensor with a real radio:
+
+```bash
+python3 -m wlanscope.synth /tmp/demo.pcap
+python3 -m wlanscope --headless -r /tmp/demo.pcap \
+  --api 127.0.0.1:8088 --api-token test --replay-speed 1
+```
+
+Then hit `http://127.0.0.1:8088/health` and `/events` from another terminal while it replays.
+
+### Security
+
+The API binds to the host:port you give. `127.0.0.1` keeps it local to the machine. `0.0.0.0` exposes it on all interfaces — only do that on a trusted network, or firewall the port. Always pair `--api-token` with `--api` when the port is reachable beyond localhost.
+
 `--state-file` writes the same data as `/state`, atomically, every
 `state_interval` seconds, for agents that would rather read a file.
+
+## Defaults: what's off unless you turn it on
+
+Everything that reaches outside the process is opt-in:
+
+| Integration | CLI flag | Default |
+|---|---|---|
+| HTTP API | `--api host:port` | off |
+| Webhook sink | `--webhook URL` | off |
+| Syslog sink | `--syslog host[:port]` | off |
+| JSON-lines event file | `--events-file path` | off |
+| State file | `--state-file path` | off |
+| Stdout events (headless only) | `--stdout-events` | off unless headless with no other output |
+| Interactive TUI (no flags) | none | capture + UI only, nothing external |
+
+Running `python3 -m wlanscope -i wlan1mon` interactively starts capture and the curses UI with **no external integration code** executing — no API listener, no webhook posts, no syslog, no file writes.
 
 ## Running as a service
 

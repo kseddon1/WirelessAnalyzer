@@ -25,10 +25,10 @@ class Thresholds:
     high_util_share: float = 0.6         # share of BSS data frames
     high_util_min_bss_fps: float = 50.0  # ...when the BSS carries at least this
     # link quality
-    retry_pct: float = 20.0
+    retry_pct: float = 10.0
     retry_min_frames: int = 50
     low_rssi: float = -80.0
-    low_snr: float = 15.0
+    low_snr: float = 19.0
     low_rate_mbps: float = 12.0
     sticky_rssi: float = -75.0
     # AP
@@ -52,6 +52,30 @@ class Thresholds:
     evil_twin_score: int = 3
     learning_period: float = 15.0        # suppress "new" events at startup
     noise_floor: float = -95.0           # SNR estimate when driver lacks noise
+    # ---- observation / heuristic thresholds (four symptom categories) ----
+    # (A) weak / deteriorating link
+    obs_rssi_weak: float = -70.0         # RSSI below this = weak link
+    obs_rssi_drop_db: float = 10.0       # RSSI drop of this much = deterioration
+    obs_retry_pct: float = 30.0          # retry rate above this = retry spike
+    obs_retry_min_frames: int = 20       # min frames before judging retry rate
+    obs_rate_drop_pct: float = 30.0      # PHY rate drop of this much = rate change
+    obs_rate_min_samples: int = 5        # min rate samples before judging
+    # radio / channel
+    obs_channel_util_pct: float = 70.0   # BSS-load utilisation above this = high
+    obs_noise_rise_db: float = 5.0       # noise floor rise of this much = interference
+    # (B) sticky client
+    obs_sticky_rssi: float = -75.0        # client RSSI below this = weak on current AP
+    obs_sticky_neighbor_db: float = 10.0  # neighbor AP must be this much stronger
+    obs_sticky_min_assoc_s: float = 60.0  # associated this long before sticky applies
+    obs_sticky_roam_lookback_s: float = 300.0  # roam lookback for stickiness
+    # (C) roaming disruption
+    obs_roam_disruption_window_s: float = 30.0  # window after a roam to check loss
+    obs_roam_disruption_loss_pct: float = 20.0  # packet-loss share after roam
+    obs_roam_latency_multiplier: float = 3.0    # latency multiplier after roam
+    # (D) connected-but-broken
+    obs_connected_idle_s: float = 60.0   # associated but idle this long = connected_idle
+    obs_throughput_drop_pct: float = 50.0  # throughput drop vs baseline = degradation
+    obs_min_baseline_frames: int = 100   # frames needed for a throughput baseline
 
 
 @dataclass

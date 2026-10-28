@@ -9,6 +9,7 @@ import statistics
 from collections import Counter
 
 from .constants import SECURITY_RANK
+from .heuristics import run_heuristics
 
 # client issue -> (severity, short label for the UI)
 CLIENT_ISSUES = {
@@ -148,6 +149,22 @@ class Detector:
 
         for cl in list(e.clients.values()):
             self._client(cl, now)
+
+        # ---- explainable heuristics: observations -> diagnoses (A-E)
+        for d in run_heuristics(e, now=now):
+            self._heuristic_event(d, now)
+
+    def _heuristic_event(self, d, now):
+        """Emit one Diagnosis as a HEUR_<CODE> event on the bus."""
+        self.bus.emit(f"HEUR_{d.code}", d.severity, "heuristic",
+                      d.summary, state="raised",
+                      clients=d.clients, bssids=d.bssids,
+                      details={"code": d.code, "name": d.name,
+                               "confidence": d.confidence,
+                               "explanation": d.explanation,
+                               "evidence": d.evidence,
+                               "recommended": d.recommended,
+                               "citation": d.citation})
 
     def _ap_checks(self, ap, now):
         th = self.th

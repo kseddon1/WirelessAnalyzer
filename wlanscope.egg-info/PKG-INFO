@@ -1,0 +1,5 @@
+Metadata-Version: 2.4
+Name: wlanscope
+Version: 0.1.0
+Summary: 802.11 WLAN discovery, analysis and event sensor (curses UI or headless)
+Requires-Python: >=3.9

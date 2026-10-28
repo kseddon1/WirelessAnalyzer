@@ -2,6 +2,7 @@
 statistics once per second and runs the detectors."""
 
 import logging
+import statistics
 import struct
 import threading
 import time
@@ -13,6 +14,16 @@ from .detect import Detector
 from .dot11 import (bss_width, find_ie, is_local_admin, is_multicast,
                     llc_ethertype, parse_eapol, parse_ies, summarize_security)
 from .model import AccessPoint, Client, Counters, History
+from .observations import (ObservationStore, Observation,
+                           CONNECTIVITY, RADIO, PERFORMANCE, PROTOCOL,
+                           OBS_ASSOC, OBS_REASSOC, OBS_DISCONNECT, OBS_ROAM,
+                           OBS_AUTH_FAIL, OBS_ASSOC_FAIL, OBS_BSSID_CHANGE,
+                           OBS_RSSI_DROP, OBS_SNR_DROP, OBS_RETRY_SPIKE,
+                           OBS_CHANNEL_UTIL, OBS_RATE_CHANGE, OBS_BAND_DIFF,
+                           OBS_THROUGHPUT_DROP, OBS_LATENCY_SPIKE,
+                           OBS_PACKET_LOSS, OBS_CONNECTED_IDLE,
+                           OBS_DEAUTH, OBS_DISASSOC, OBS_HANDSHAKE_FAIL,
+                           OBS_EAP_FAILURE, OBS_MGMT_ANOMALY)
 
 log = logging.getLogger(__name__)
 
@@ -56,6 +67,10 @@ class Engine:
         self.clock = None              # timestamp of last frame (replay clock)
         self.last_tick = None
         self.new_bss_times = deque(maxlen=2000)
+        self.observations = ObservationStore()
+        self._obs_seq = 0
+        # derived-observation state: client -> {rssi, rate, throughput_baseline}
+        self._obs_state = {}
         self.detector = Detector(self)
         bus.clock = self.now
 
@@ -257,6 +272,13 @@ class Engine:
                     self._auth_failure(cl, ap, "auth", C.status_text(status), now,
                                        {"algorithm": C.AUTH_ALGOS.get(algo, algo),
                                         "status": status})
+                    self._observe(CONNECTIVITY, OBS_AUTH_FAIL,
+                                  f"{ap.bssid} rejected auth from {cl.mac}: "
+                                  f"{C.status_text(status)}", now,
+                                  client=cl.mac, bssid=ap.bssid, ssid=ap.ssid,
+                                  channel=ap.channel, band=ap.band,
+                                  details={"algorithm": C.AUTH_ALGOS.get(algo, algo),
+                                           "status": status})
             else:
                 self._from_client(cl, f, now)
                 if cl.state != "associated" or cl.bssid != bssid:
@@ -317,6 +339,12 @@ class Engine:
             elif status not in BENIGN_STATUS:
                 self._auth_failure(cl, ap, "assoc", C.status_text(status), now,
                                    {"status": status})
+                self._observe(CONNECTIVITY, OBS_ASSOC_FAIL,
+                              f"{ap.bssid} rejected assoc from {cl.mac}: "
+                              f"{C.status_text(status)}", now,
+                              client=cl.mac, bssid=ap.bssid, ssid=ap.ssid,
+                              channel=ap.channel, band=ap.band,
+                              details={"status": status})
             return
 
         if st in (C.DEAUTH, C.DISASSOC):
@@ -324,6 +352,7 @@ class Engine:
             if len(body) >= 2 and not f.protected:
                 reason = struct.unpack_from("<H", body, 0)[0]
             kind = "deauth" if st == C.DEAUTH else "disassoc"
+            obs_type = OBS_DEAUTH if st == C.DEAUTH else OBS_DISASSOC
             ap = self._ap(bssid, now)
             self._count(ap.counters, f)
             ap.counters.mgmt += 1
@@ -333,6 +362,13 @@ class Engine:
                 self._from_ap(ap, f, now)
                 if is_multicast(sta):
                     self.detector.broadcast_deauth(ap, kind, reason, now)
+                    self._observe(PROTOCOL, obs_type,
+                                  f"broadcast {kind} from {ap.bssid} "
+                                  f"({C.reason_text(reason)})", now,
+                                  bssid=ap.bssid, ssid=ap.ssid,
+                                  channel=ap.channel, band=ap.band,
+                                  details={"kind": kind, "reason": reason,
+                                           "clients": len(ap.clients)})
                     for m in list(ap.clients):
                         cl = self.clients.get(m)
                         if cl:
@@ -344,6 +380,12 @@ class Engine:
                     return
                 self._to_client(cl, f)
                 cl.deauth_times.append(now)
+                self._observe(PROTOCOL, obs_type,
+                              f"{ap.bssid} sent {kind} to {cl.mac} "
+                              f"({C.reason_text(reason)})", now,
+                              client=cl.mac, bssid=ap.bssid, ssid=ap.ssid,
+                              channel=ap.channel, band=ap.band,
+                              details={"kind": kind, "reason": reason, "by": "ap"})
                 by = "ap"
             else:
                 if is_multicast(sta):
@@ -352,6 +394,12 @@ class Engine:
                 if cl is None:
                     return
                 self._from_client(cl, f, now)
+                self._observe(PROTOCOL, obs_type,
+                              f"{cl.mac} sent {kind} to {ap.bssid} "
+                              f"({C.reason_text(reason)})", now,
+                              client=cl.mac, bssid=ap.bssid, ssid=ap.ssid,
+                              channel=ap.channel, band=ap.band,
+                              details={"kind": kind, "reason": reason, "by": "client"})
                 by = "client"
             setattr(cl.counters, kind, getattr(cl.counters, kind) + 1)
             self._disconnect(cl, kind, reason, by, now)
@@ -480,6 +528,26 @@ class Engine:
         ap.tsf_at = now
         ap.uptime = int(tsf / 1e6)
 
+    # ------------------------------------------------------------ observations
+    def _observe(self, category, obs_type, message, now, **ctx):
+        """Emit and store a single OBS_* observation.
+
+        Observation events are always state="observed" (one-shot facts) and
+        carry no cooldown -- the heuristics layer aggregates them over time
+        windows instead of alerting on each individual frame.
+        """
+        obs = Observation(category=category, obs_type=obs_type, ts=now,
+                          message=message, **ctx)
+        self.observations.add(obs)
+        self._obs_seq += 1
+        self.bus.emit(f"OBS_{obs_type.upper()}", "info", category, message,
+                      state="observed", key=None, cooldown=0,
+                      ssid=ctx.get("ssid"), bssid=ctx.get("bssid"),
+                      client=ctx.get("client"), channel=ctx.get("channel"),
+                      band=ctx.get("band"), rssi=ctx.get("rssi"),
+                      details=ctx.get("details", {}))
+        return obs
+
     # ------------------------------------------------------------ helpers
     def _from_client(self, cl, f, now):
         """Frame transmitted by a client."""
@@ -532,12 +600,24 @@ class Engine:
                                    "same_ess": same_ess,
                                    "from_channel": old.channel if old else None},
                           cooldown=5)
+            self._observe(CONNECTIVITY, OBS_ROAM,
+                          f"{cl.mac} roamed {prev} -> {ap.bssid} ({how})", now,
+                          client=cl.mac, bssid=ap.bssid, ssid=ap.ssid,
+                          channel=ap.channel, band=ap.band, rssi=cl.signal.avg,
+                          details={"from_bssid": prev, "to_bssid": ap.bssid, "how": how,
+                                   "same_ess": same_ess,
+                                   "from_channel": old.channel if old else None})
         elif how != "data" and (cl.state != "associated" or prev != ap.bssid):
             self.bus.emit("CLIENT_ASSOCIATED", "info", "client",
                           f"{cl.mac} associated to {ap.display_ssid} ({ap.bssid})",
                           ssid=ap.ssid, bssid=ap.bssid, client=cl.mac,
                           channel=ap.channel, band=ap.band, rssi=cl.signal.avg,
                           details={"how": how, "aid": cl.aid}, cooldown=30)
+            self._observe(CONNECTIVITY, OBS_REASSOC if how == "reassoc" else OBS_ASSOC,
+                          f"{cl.mac} associated to {ap.display_ssid} ({ap.bssid})", now,
+                          client=cl.mac, bssid=ap.bssid, ssid=ap.ssid,
+                          channel=ap.channel, band=ap.band, rssi=cl.signal.avg,
+                          details={"how": how, "aid": cl.aid})
         elif how == "data" and prev is None and not self.learning \
                 and cl.last_disconnect is None:
             self.bus.emit("CLIENT_NEW", "info", "client",
@@ -560,6 +640,16 @@ class Engine:
             cl.last_bssid = cl.bssid
             cl.bssid = None
         self._set_state(cl, "disconnected", now)
+        if not quiet:
+            self._observe(CONNECTIVITY, OBS_DISCONNECT,
+                          f"{cl.mac} disconnected from {cl.last_bssid} "
+                          f"({C.reason_text(reason)})", now,
+                          client=cl.mac, bssid=cl.last_bssid,
+                          ssid=ap.ssid if ap else None,
+                          channel=ap.channel if ap else None,
+                          band=ap.band if ap else None,
+                          details={"kind": kind, "reason": reason, "by": by,
+                                   "reason_text": C.reason_text(reason)})
         if reason in HANDSHAKE_REASONS:
             cl.hs_failures.append((now, C.reason_text(reason)))
             cl.hs["state"] = "failed"
@@ -751,6 +841,13 @@ class Engine:
                 cl.eap_result = "failure"
                 self._auth_failure(cl, ap, "eap", "EAP-Failure from authentication server",
                                    now, {"method": cl.eap_method})
+                self._observe(PROTOCOL, OBS_EAP_FAILURE,
+                              f"{ap.bssid} EAP-Failure for {cl.mac} "
+                              f"({cl.eap_method or 'unknown'})", now,
+                              client=cl.mac, bssid=ap.bssid, ssid=ap.ssid,
+                              channel=ap.channel, band=ap.band,
+                              rssi=cl.signal.avg,
+                              details={"method": cl.eap_method})
 
     def _handshake_failure(self, cl, ap, now, why):
         cl.hs_failures.append((now, why))
@@ -760,6 +857,11 @@ class Engine:
                       f"{cl.mac} 4-way handshake failed with {ap.bssid}: {why}",
                       ssid=ap.ssid, bssid=ap.bssid, client=cl.mac, channel=ap.channel,
                       band=ap.band, rssi=cl.signal.avg, details={"why": why}, cooldown=60)
+        self._observe(PROTOCOL, OBS_HANDSHAKE_FAIL,
+                      f"{cl.mac} 4-way handshake failed with {ap.bssid}: {why}",
+                      now, client=cl.mac, bssid=ap.bssid, ssid=ap.ssid,
+                      channel=ap.channel, band=ap.band, rssi=cl.signal.avg,
+                      details={"why": why})
 
     # ------------------------------------------------------------ tick
     def tick_if_due(self, now=None):
@@ -786,6 +888,7 @@ class Engine:
                 key = cl.chan_key
             cl.history.add(now, self.obs(key, now), cl.counters.snapshot())
             cl.signal.tick()
+        self._derive_observations(now)
         self.detector.run(now)
         self._expire(now)
 
@@ -798,6 +901,103 @@ class Engine:
                 ap.clients.discard(m)
         for b in [b for b, a in self.aps.items() if now - a.last_seen > fa]:
             del self.aps[b]
+
+    def _derive_observations(self, now):
+        """Derive higher-bandwidth observations from per-client history.
+
+        Produces CONNECTED_IDLE, THROUGHPUT_DROP, PACKET_LOSS, RATE_CHANGE and
+        RSSI_DROP observations that heuristics aggregate over time windows.
+        These are one-shot facts emitted once per condition per client per
+        window, not per-frame.
+        """
+        th = self.th
+        for cl in self.clients.values():
+            st = self._obs_state.setdefault(cl.mac, {})
+            ap = self.aps.get(cl.bssid) if cl.bssid else None
+            if ap is None:
+                continue
+
+            # ---- connected-but-idle: associated but passing little/no data
+            if cl.state == "associated" and cl.last_data is not None:
+                idle = now - cl.last_data
+                if idle >= th.obs_connected_idle_s:
+                    last = st.get("connected_idle_emitted")
+                    if last is None or now - last >= th.active_window:
+                        self._observe(PERFORMANCE, OBS_CONNECTED_IDLE,
+                                      f"{cl.mac} associated to {ap.bssid} but "
+                                      f"passing little/no data for {idle:.0f}s",
+                                      now, client=cl.mac, bssid=ap.bssid,
+                                      ssid=ap.ssid, channel=ap.channel,
+                                      band=ap.band, rssi=cl.signal.avg,
+                                      details={"idle_s": round(idle, 1),
+                                               "rssi": cl.signal.avg})
+                        st["connected_idle_emitted"] = now
+
+            # ---- throughput drop vs this client's own baseline
+            d10, obs10 = cl.history.window("data_bytes", 10.0)
+            kbps = d10 * 8 / 1000 / max(obs10, 0.05)
+            base = st.get("throughput_kbps")
+            if base is None:
+                st["throughput_kbps"] = kbps
+            elif kbps > 0 and base > 0:
+                drop = 100.0 * (base - kbps) / base
+                if drop >= th.obs_throughput_drop_pct:
+                    last = st.get("throughput_drop_emitted")
+                    if last is None or now - last >= th.active_window:
+                        self._observe(PERFORMANCE, OBS_THROUGHPUT_DROP,
+                                      f"{cl.mac} throughput {kbps:.0f} kbps, "
+                                      f"{drop:.0f}% below its {base:.0f} kbps "
+                                      f"baseline", now, client=cl.mac,
+                                      bssid=ap.bssid, ssid=ap.ssid,
+                                      channel=ap.channel, band=ap.band,
+                                      rssi=cl.signal.avg,
+                                      details={"kbps": round(kbps, 1),
+                                               "baseline_kbps": round(base, 1),
+                                               "drop_pct": round(drop, 1)})
+                        st["throughput_drop_emitted"] = now
+            # slow-moving baseline
+            if kbps > 0:
+                st["throughput_kbps"] = base * 0.9 + kbps * 0.1 if base else kbps
+
+            # ---- packet loss: retries without corresponding fresh frames
+            d, _ = cl.history.window("data", 10.0)
+            rr, _ = cl.history.window("data_retries", 10.0)
+            loss_pct = 100.0 * rr / max(d, 1)
+            if d >= th.obs_retry_min_frames and loss_pct >= th.obs_retry_pct:
+                last = st.get("packet_loss_emitted")
+                if last is None or now - last >= th.active_window:
+                    self._observe(PERFORMANCE, OBS_PACKET_LOSS,
+                                  f"{cl.mac} {loss_pct:.0f}% retries over {d} "
+                                  f"data frames ({rr} retries)", now,
+                                  client=cl.mac, bssid=ap.bssid,
+                                  ssid=ap.ssid, channel=ap.channel,
+                                  band=ap.band, rssi=cl.signal.avg,
+                                  details={"loss_pct": round(loss_pct, 1),
+                                           "data_frames": d, "retries": rr})
+                    st["packet_loss_emitted"] = now
+
+            # ---- rate change vs recent median
+            rates = list(cl.rates_up) + list(cl.rates_down)
+            if len(rates) >= th.obs_rate_min_samples:
+                med = statistics.median(rates)
+                prev_med = st.get("rate_median")
+                if prev_med is not None and med > 0:
+                    change = 100.0 * abs(med - prev_med) / prev_med
+                    if change >= th.obs_rate_drop_pct:
+                        last = st.get("rate_change_emitted")
+                        if last is None or now - last >= th.active_window:
+                            self._observe(RADIO, OBS_RATE_CHANGE,
+                                          f"{cl.mac} median PHY rate moved "
+                                          f"{prev_med:.0f} -> {med:.0f} Mbps "
+                                          f"({change:.0f}%)", now,
+                                          client=cl.mac, bssid=ap.bssid,
+                                          ssid=ap.ssid, channel=ap.channel,
+                                          band=ap.band, rssi=cl.signal.avg,
+                                          details={"rate_mbps": round(med, 1),
+                                                   "prev_rate_mbps": round(prev_med, 1),
+                                                   "change_pct": round(change, 1)})
+                            st["rate_change_emitted"] = now
+                st["rate_median"] = med
 
     # ------------------------------------------------------------ queries
     def visible_aps(self):

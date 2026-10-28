@@ -47,7 +47,7 @@ class EventBus:
 
     def emit(self, alert, severity, category, message, *, ssid=None, bssid=None,
              client=None, channel=None, band=None, rssi=None, state="observed",
-             details=None, key=None, cooldown=None):
+             details=None, key=None, cooldown=None, clients=None, bssids=None):
         now = self.clock()
         ck = key or (alert, bssid, client, state)
         cd = self.cooldown if cooldown is None else cooldown
@@ -80,6 +80,8 @@ class EventBus:
                 "rssi": None if rssi is None else round(rssi, 1),
                 "message": message,
                 "details": details or {},
+                "clients": clients or [],
+                "bssids": bssids or [],
             }
             self.counts[severity] = self.counts.get(severity, 0) + 1
             self.recent.append(ev)
